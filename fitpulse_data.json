@@ -1,0 +1,23 @@
+import json
+
+# Load JSON data
+with open('fitpulse_data.json', 'r') as file:
+    data = json.load(file)
+
+# Detect anomalies where HeartRate > 100
+anomalies = [entry for entry in data if entry['HeartRate'] > 100]
+
+# Print all data
+print("Full Data:")
+for entry in data:
+    print(entry)
+
+print("\nAnomalies Detected (HeartRate > 100):")
+for anomaly in anomalies:
+    print(anomaly)
+
+# Save anomalies to a new JSON file
+with open('fitpulse_anomalies.json', 'w') as outfile:
+    json.dump(anomalies, outfile, indent=4)
+
+print("\nAnomalies saved to 'fitpulse_anomalies.json'")
