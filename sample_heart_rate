@@ -1,0 +1,25 @@
+import pandas as pd
+import random
+from datetime import datetime, timedelta
+
+def generate_heart_rate_data(start_time, num_records=20):
+    data = []
+    for i in range(num_records):
+        timestamp = start_time + timedelta(minutes=i * 5)
+        heart_rate = random.randint(60, 180)  # Simulate between 60 and 180 bpm
+        data.append({"Timestamp": timestamp, "HeartRate": heart_rate})
+    return pd.DataFrame(data)
+
+def main():
+    now = datetime.now().replace(second=0, microsecond=0)
+    df = generate_heart_rate_data(now, num_records=20)
+    
+    print("Sample Heart Rate Data:\n")
+    print(df)
+
+    # Optional: Save to CSV
+    df.to_csv("sample_heart_rate.csv", index=False)
+    print("\nData saved to sample_heart_rate.csv")
+
+if __name__ == "__main__":
+    main()
