@@ -1,0 +1,18 @@
+import pandas as pd
+from datetime import datetime
+
+# Load data with timestamp parsing
+df = pd.read_csv('fitpulse_load.csv', parse_dates=['Timestamp'])
+
+# Show all timestamps
+print("All timestamps:")
+print(df['Timestamp'])
+
+# Filter records between 8:10 and 8:40 on 2025-09-01
+start_time = datetime.strptime('2025-09-01 08:10', '%Y-%m-%d %H:%M')
+end_time = datetime.strptime('2025-09-01 08:40', '%Y-%m-%d %H:%M')
+
+filtered = df[(df['Timestamp'] >= start_time) & (df['Timestamp'] <= end_time)]
+
+print("\nRecords between 08:10 and 08:40:")
+print(filtered)
