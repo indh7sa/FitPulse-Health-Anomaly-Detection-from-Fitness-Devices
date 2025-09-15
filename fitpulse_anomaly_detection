@@ -1,0 +1,26 @@
+import pandas as pd
+
+# Load data
+df = pd.read_csv('fitness_data.csv', parse_dates=['Timestamp'])
+
+# Show the original data
+print("Original Fitness Data:")
+print(df)
+
+# --- Anomaly Detection Logic ---
+
+# Define thresholds (you can adjust these)
+heart_rate_upper = df['HeartRate'].mean() + 2 * df['HeartRate'].std()
+step_lower = df['Steps'].mean() - 2 * df['Steps'].std()
+
+# Detect anomalies
+df['HeartRate_Anomaly'] = df['HeartRate'] > heart_rate_upper
+df['LowStep_Anomaly'] = df['Steps'] < step_lower
+df['Anomaly'] = df['HeartRate_Anomaly'] | df['LowStep_Anomaly']
+
+# Show the anomalies
+print("\nAnomalies Detected:")
+print(df[df['Anomaly'] == True])
+
+# Optional: Save output
+df.to_csv('fitness_data_with_anomalies.csv', index=False)
