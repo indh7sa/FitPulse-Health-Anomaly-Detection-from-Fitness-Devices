@@ -1,0 +1,31 @@
+import json
+
+# Load data from JSON file
+with open('fitness_data.json', 'r') as file:
+    data = json.load(file)
+
+# Define a simple anomaly detection function
+def detect_anomalies(data, hr_threshold=100):
+    anomalies = []
+    for entry in data:
+        if entry['HeartRate'] > hr_threshold:
+            anomalies.append(entry)
+    return anomalies
+
+# Detect anomalies
+anomalies = detect_anomalies(data)
+
+# Print original data and anomalies
+print("Original Data:")
+for d in data:
+    print(d)
+
+print("\nDetected Anomalies (Heart Rate > 100):")
+for a in anomalies:
+    print(a)
+
+# Save anomalies to output JSON file
+with open('fitness_anomalies_output.json', 'w') as outfile:
+    json.dump(anomalies, outfile, indent=4)
+
+print("\nAnomalies saved to 'fitness_anomalies_output.json'")
