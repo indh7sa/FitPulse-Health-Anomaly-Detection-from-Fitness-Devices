@@ -1,0 +1,18 @@
+import pandas as pd
+
+# Load CSV file
+df = pd.read_csv('fitpulse_load.csv', parse_dates=['Timestamp'])
+
+# Show first 5 rows
+print("First 5 rows of data:")
+print(df.head())
+
+# Simple anomaly detection: Heart Rate > 100
+anomalies = df[df['HeartRate'] > 100]
+
+print("\nAnomalies detected (HeartRate > 100):")
+print(anomalies)
+
+# Save anomalies to a new CSV file
+anomalies.to_csv('fitpulse_anomalies.csv', index=False)
+print("\nAnomalies saved to 'fitpulse_anomalies.csv'")
