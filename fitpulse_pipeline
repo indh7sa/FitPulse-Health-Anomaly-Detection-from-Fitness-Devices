@@ -1,0 +1,31 @@
+import pandas as pd
+
+def load_data(filepath):
+    df = pd.read_csv(filepath, parse_dates=['Timestamp'])
+    print(f"Loaded {len(df)} records.")
+    return df
+
+def preprocess_data(df):
+    df = df.sort_values('Timestamp').reset_index(drop=True)
+    return df
+
+def detect_anomalies(df, hr_threshold=100):
+    anomalies = df[df['HeartRate'] > hr_threshold]
+    print(f"Detected {len(anomalies)} anomalies with HeartRate > {hr_threshold}.")
+    return anomalies
+
+def save_results(df, filepath):
+    df.to_csv(filepath, index=False)
+    print(f"Anomalies saved to {filepath}")
+
+def main():
+    data_file = 'fitpulse_load.csv'
+    output_file = 'fitpulse_anomalies.csv'
+    
+    df = load_data(data_file)
+    df = preprocess_data(df)
+    anomalies = detect_anomalies(df)
+    save_results(anomalies, output_file)
+
+if __name__ == "__main__":
+    main()
