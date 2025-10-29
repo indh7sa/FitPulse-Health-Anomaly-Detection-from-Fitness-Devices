@@ -1,0 +1,725 @@
+from __future__ import annotations
+import streamlit as st
+import pandas as pd
+import numpy as np
+import io
+import json
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple
+import plotly.express as px
+import plotly.graph_objects as go
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.ensemble import IsolationForest
+
+try:
+    from prophet import Prophet
+    PROPHET_AVAILABLE = True
+except Exception:
+    PROPHET_AVAILABLE = False
+
+try:
+    from tsfresh import extract_features
+    from tsfresh.utilities.dataframe_functions import impute
+    from tsfresh.feature_extraction import MinimalFCParameters
+    TSFRESH_AVAILABLE = True
+except Exception:
+    TSFRESH_AVAILABLE = False
+
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except Exception:
+    SHAP_AVAILABLE = False
+
+try:
+    from pptx import Presentation
+    from pptx.util import Inches
+    PPTX_AVAILABLE = True
+except Exception:
+    PPTX_AVAILABLE = False
+
+try:
+    import kaleido
+    KALEIDO_AVAILABLE = True
+except Exception:
+    KALEIDO_AVAILABLE = False
+
+# -------------------------
+# Styling constants
+# -------------------------
+PRIMARY_COLOR = "#1f77b4"
+SECONDARY_COLOR = "#ff7f0e"
+ACCENT_BG = "#0f1724"  # for custom HTML panels
+
+# -------------------------
+# Utilities
+# -------------------------
+def now_str() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def df_to_excel_bytes(dfs: Dict[str, pd.DataFrame]) -> bytes:
+    """Write multiple DataFrames to an in-memory Excel file and return bytes."""
+    import openpyxl  # ensure engine is available
+    with io.BytesIO() as bio:
+        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+            for sheet_name, df in dfs.items():
+                # sheet names limited to 31 characters by Excel
+                df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+        return bio.getvalue()
+
+def fig_to_png_bytes(fig) -> bytes:
+    if not KALEIDO_AVAILABLE:
+        raise RuntimeError("kaleido not available")
+    return fig.to_image(format="png")
+
+def create_pptx_with_images(images: List[bytes], titles: List[str]) -> bytes:
+    if not PPTX_AVAILABLE:
+        raise RuntimeError("python-pptx not available")
+    prs = Presentation()
+    for img_bytes, title in zip(images, titles):
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        try:
+            slide.shapes.title.text = title
+        except Exception:
+            pass
+        img_stream = io.BytesIO(img_bytes)
+        slide.shapes.add_picture(img_stream, Inches(0.5), Inches(0.5), width=Inches(9))
+    with io.BytesIO() as out:
+        prs.save(out)
+        return out.getvalue()
+
+# -------------------------
+# Sample data creation (cached)
+# -------------------------
+@st.cache_data
+def create_sample_data(single_day: str = None) -> Dict[str, pd.DataFrame]:
+    if single_day is None:
+        single_day = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    # minute-level heart rate from 06:00 to 23:59
+    timestamps = pd.date_range(start=f"{single_day} 06:00:00", end=f"{single_day} 23:59:00", freq="1min")
+    hr = []
+    for ts in timestamps:
+        tod = ts.hour + ts.minute / 60.0
+        base = 70 + np.random.normal(0, 3)
+        # some realistic peaks
+        if 6 <= tod < 7.5:
+            base += 15
+        if 9 <= tod < 10:
+            base += 35
+        if 12 <= tod < 12.5:
+            base += 65
+        if 14 <= tod < 15:
+            base += 25
+        if 16 <= tod < 16.2:
+            base -= 35
+        if 19 <= tod < 19.02:
+            base += 80
+        hr.append(max(30, min(220, base)))
+    heart_rate_df = pd.DataFrame({"timestamp": timestamps, "heart_rate": hr})
+
+    # steps (5-minute buckets)
+    step_timestamps = pd.date_range(start=f"{single_day} 06:00:00", end=f"{single_day} 23:59:00", freq="5min")
+    steps = []
+    for ts in step_timestamps:
+        tod = ts.hour + ts.minute / 60.0
+        s = 20 + np.random.randint(-8, 8)
+        if 6 <= tod < 7:
+            s = 60 + np.random.randint(-10, 10)
+        if 12 <= tod < 13:
+            s = 80 + np.random.randint(-20, 20)
+        if 18 <= tod < 19:
+            s = 120 + np.random.randint(-30, 30)
+        # occasional spike
+        if 15 <= tod < 15.2:
+            s = 3000
+        steps.append(max(0, s))
+    steps_df = pd.DataFrame({"timestamp": step_timestamps, "step_count": steps})
+
+    # sleep summary
+    sleep_df = pd.DataFrame({
+        "date": [pd.to_datetime(single_day).date()],
+        "duration_minutes": [420],
+        "sleep_quality": [0.85]
+    })
+    return {"heart_rate": heart_rate_df, "steps": steps_df, "sleep": sleep_df}
+
+# -------------------------
+# Detection classes
+# -------------------------
+class ThresholdAnomaly:
+    def __init__(self, rules: Dict = None):
+        default = {
+            "heart_rate": {"col": "heart_rate", "min": 40, "max": 120, "sustained_min": 10},
+            "steps": {"col": "step_count", "min": 0, "max": 1000, "sustained_min": 5},
+            "sleep": {"col": "duration_minutes", "min": 180, "max": 720, "sustained_min": 0},
+        }
+        self.rules = rules or default
+
+    def detect(self, df: pd.DataFrame, data_type: str) -> Tuple[pd.DataFrame, Dict]:
+        df = df.copy()
+        report = {"method": "threshold", "anomalies": 0}
+        if data_type not in self.rules:
+            return df, report
+        rule = self.rules[data_type]
+        col = rule["col"]
+        if col not in df.columns:
+            return df, report
+
+        df["threshold_anomaly"] = False
+        df["threshold_reason"] = ""
+        df["threshold_severity"] = "normal"
+
+        too_high = df[col] > rule["max"]
+        too_low = df[col] < rule["min"]
+
+        if rule.get("sustained_min", 0) > 0 and "timestamp" in df.columns:
+            window = int(rule["sustained_min"])
+            # rolling sum must equal window to be sustained
+            too_high_s = too_high.rolling(window=window, min_periods=window).sum() >= window
+            too_low_s = too_low.rolling(window=window, min_periods=window).sum() >= window
+            df.loc[too_high_s.fillna(False), ["threshold_anomaly", "threshold_reason", "threshold_severity"]] = [
+                True,
+                f"high_{col}",
+                "high",
+            ]
+            df.loc[too_low_s.fillna(False), ["threshold_anomaly", "threshold_reason", "threshold_severity"]] = [
+                True,
+                f"low_{col}",
+                "medium",
+            ]
+        else:
+            df.loc[too_high, ["threshold_anomaly", "threshold_reason", "threshold_severity"]] = [
+                True,
+                f"high_{col}",
+                "high",
+            ]
+            df.loc[too_low, ["threshold_anomaly", "threshold_reason", "threshold_severity"]] = [
+                True,
+                f"low_{col}",
+                "high",
+            ]
+        report["anomalies"] = int(df["threshold_anomaly"].sum())
+        return df, report
+
+class ProphetResidual:
+    def __init__(self, std_thresh: float = 3.0):
+        self.std_thresh = std_thresh
+
+    def fit_and_detect(self, df: pd.DataFrame, data_type: str) -> Tuple[pd.DataFrame, Dict]:
+        report = {"method": "prophet_residual", "anomalies": 0}
+        df = df.copy().reset_index(drop=True)
+        metric_map = {"heart_rate": "heart_rate", "steps": "step_count", "sleep": "duration_minutes"}
+        if data_type not in metric_map or metric_map[data_type] not in df.columns:
+            return df, report
+        col = metric_map[data_type]
+        if not PROPHET_AVAILABLE:
+            report["error"] = "prophet_not_installed"
+            return df, report
+        try:
+            prophet_df = pd.DataFrame({"ds": pd.to_datetime(df["timestamp"]), "y": df[col].astype(float)})
+            m = Prophet(daily_seasonality=True, weekly_seasonality=True)
+            m.fit(prophet_df)
+            future = prophet_df[["ds"]].copy()
+            forecast = m.predict(future)
+            forecast = forecast.rename(columns={"ds": "timestamp", "yhat": "predicted"})
+            df = df.merge(forecast[["timestamp", "predicted", "yhat_lower", "yhat_upper"]], on="timestamp", how="left")
+            df["residual"] = df[col] - df["predicted"]
+            resid_std = df["residual"].std()
+            thresh = self.std_thresh * resid_std if pd.notnull(resid_std) else np.inf
+            df["residual_anomaly"] = df["residual"].abs() > thresh
+            df.loc[df["residual_anomaly"], "residual_reason"] = "deviates_model"
+            report["anomalies"] = int(df["residual_anomaly"].sum())
+            report["residual_std"] = float(resid_std) if pd.notnull(resid_std) else None
+        except Exception as e:
+            report["error"] = str(e)
+        return df, report
+
+class IsolationForestDetector:
+    def __init__(self, contamination: float = 0.01, random_state: int = 42):
+        self.contamination = contamination
+        self.random_state = random_state
+
+    def detect(self, df: pd.DataFrame, numeric_cols: List[str]) -> Tuple[pd.DataFrame, Dict]:
+        report = {"method": "isolation_forest", "anomalies": 0}
+        df = df.copy().reset_index(drop=True)
+        if len(numeric_cols) == 0:
+            return df, report
+        X = df[numeric_cols].fillna(0).values
+        try:
+            iso = IsolationForest(contamination=self.contamination, random_state=self.random_state)
+            preds = iso.fit_predict(X)
+            df["iforest_anomaly"] = preds == -1
+            report["anomalies"] = int(df["iforest_anomaly"].sum())
+        except Exception as e:
+            report["error"] = str(e)
+        return df, report
+
+class ClusterDetector:
+    def detect(self, df: pd.DataFrame, numeric_cols: List[str], method: str = "kmeans", k: int = 3) -> Tuple[pd.DataFrame, Dict]:
+        report = {"method": "cluster", "anomalies": 0}
+        df = df.copy().reset_index(drop=True)
+        if len(numeric_cols) == 0:
+            return df, report
+        X = df[numeric_cols].fillna(0).values
+        try:
+            scaler = StandardScaler()
+            Xs = scaler.fit_transform(X)
+            if method == "kmeans":
+                km = KMeans(n_clusters=max(1, k), random_state=0)
+                labels = km.fit_predict(Xs)
+                df["cluster_label"] = labels
+                counts = pd.Series(labels).value_counts()
+                small = counts[counts < max(2, int(0.05 * len(labels)))].index.tolist()
+                df["cluster_anomaly"] = df["cluster_label"].isin(small)
+                report["anomalies"] = int(df["cluster_anomaly"].sum())
+            else:
+                db = DBSCAN(eps=0.5, min_samples=3).fit(Xs)
+                labels = db.labels_
+                df["cluster_label"] = labels
+                df["cluster_anomaly"] = df["cluster_label"] == -1
+                report["anomalies"] = int(df["cluster_anomaly"].sum())
+        except Exception as e:
+            report["error"] = str(e)
+        return df, report
+
+# -------------------------
+# Styled plotting helpers
+# -------------------------
+def plot_hr(df: pd.DataFrame, title: str = "Heart Rate"):
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df["timestamp"],
+            y=df["heart_rate"],
+            mode="lines+markers",
+            line=dict(color=PRIMARY_COLOR, width=2),
+            marker=dict(size=6, color=SECONDARY_COLOR, opacity=0.7),
+            name="Heart Rate",
+        )
+    )
+    # mark anomalies
+    if "threshold_anomaly" in df.columns:
+        a = df[df["threshold_anomaly"]]
+        if not a.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=a["timestamp"],
+                    y=a["heart_rate"],
+                    mode="markers",
+                    marker=dict(symbol="x", size=11, color="red"),
+                    name="Threshold",
+                )
+            )
+    if "residual_anomaly" in df.columns:
+        a = df[df["residual_anomaly"]]
+        if not a.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=a["timestamp"],
+                    y=a["heart_rate"],
+                    mode="markers",
+                    marker=dict(symbol="diamond", size=10, color="orange"),
+                    name="Residual",
+                )
+            )
+    if "iforest_anomaly" in df.columns:
+        a = df[df["iforest_anomaly"]]
+        if not a.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=a["timestamp"],
+                    y=a["heart_rate"],
+                    mode="markers",
+                    marker=dict(symbol="circle-open", size=12, color="white"),
+                    name="IsolationForest",
+                )
+            )
+    fig.update_layout(
+        title=f"<b>❤️ {title}</b>",
+        template="plotly_dark",
+        hovermode="x unified",
+        xaxis_title="Time",
+        yaxis_title="BPM",
+        height=520,
+    )
+    return fig
+
+def plot_steps(df: pd.DataFrame, title: str = "Steps"):
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=df["timestamp"], y=df["step_count"], name="Steps", marker_color=PRIMARY_COLOR))
+    if "threshold_anomaly" in df.columns:
+        a = df[df["threshold_anomaly"]]
+        if not a.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=a["timestamp"],
+                    y=a["step_count"],
+                    mode="markers",
+                    marker=dict(symbol="star", size=12, color="red"),
+                    name="Threshold",
+                )
+            )
+    if "iforest_anomaly" in df.columns:
+        a = df[df["iforest_anomaly"]]
+        if not a.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=a["timestamp"],
+                    y=a["step_count"],
+                    mode="markers",
+                    marker=dict(symbol="circle-open", size=10, color="white"),
+                    name="IsolationForest",
+                )
+            )
+    fig.update_layout(title=f"<b>🚶 {title}</b>", template="plotly_dark", xaxis_title="Time", yaxis_title="Steps", height=420)
+    return fig
+
+def plot_sleep(df: pd.DataFrame, title: str = "Sleep"):
+    fig = go.Figure()
+    if "duration_minutes" in df.columns:
+        x = df["timestamp"] if "timestamp" in df.columns else df["date"]
+        fig.add_trace(
+            go.Scatter(x=x, y=df["duration_minutes"] / 60.0, mode="lines+markers", name="Sleep (h)", line=dict(color=SECONDARY_COLOR))
+        )
+        if "threshold_anomaly" in df.columns:
+            a = df[df["threshold_anomaly"]]
+            if not a.empty:
+                ah = a["duration_minutes"] / 60.0
+                fig.add_trace(
+                    go.Scatter(
+                        x=a["timestamp"] if "timestamp" in a.columns else a["date"],
+                        y=ah,
+                        mode="markers",
+                        marker=dict(symbol="circle-open", size=12, color="red"),
+                        name="Anomaly",
+                    )
+                )
+    fig.update_layout(title=f"<b>😴 {title}</b>", template="plotly_dark", xaxis_title="Time/Date", yaxis_title="Hours", height=420)
+    return fig
+
+def plot_hr_heatmap(df: pd.DataFrame, title: str = "HR Heatmap by Hour"):
+    df2 = df.copy()
+    df2["hour"] = df2["timestamp"].dt.hour
+    pivot = df2.groupby("hour").heart_rate.mean().reset_index()
+    fig = px.bar(pivot, x="hour", y="heart_rate", labels={"heart_rate": "Avg HR", "hour": "Hour of Day"}, title=f"💥 {title}", color="heart_rate", color_continuous_scale="Viridis")
+    fig.update_layout(template="plotly_dark", height=380)
+    return fig
+
+# -------------------------
+# Streamlit app layout & controls
+# -------------------------
+st.set_page_config(page_title="💓 Health Dashboard", layout="wide", page_icon="💓")
+st.markdown(f"<style> .reportview-container .main .block-container{{padding-top:1rem;}}</style>", unsafe_allow_html=True)
+st.title("💓 Health Anomaly Detection")
+
+with st.sidebar:
+    st.markdown(f"<h2 style='color:{PRIMARY_COLOR}; margin-bottom:0.25rem;'>⚙️ Configuration</h2>", unsafe_allow_html=True)
+    data_mode = st.radio("Data Source", ["Sample Data", "Upload CSVs"], index=0)
+    st.markdown("---")
+    st.subheader("Data filters")
+    date_filter = st.date_input("Filter date", value=(datetime.now().date() - timedelta(days=1)))
+    time_filter = st.checkbox("Enable time-range filter", value=False)
+    if time_filter:
+        trange = st.slider("Hour range", 0, 23, (6, 23))
+    st.markdown("---")
+    st.subheader("Thresholds")
+    hr_min = st.number_input("HR min (bpm)", value=40)
+    hr_max = st.number_input("HR max (bpm)", value=120)
+    hr_sustained = st.number_input("HR sustained (minutes)", value=10, min_value=0)
+    step_max = st.number_input("Steps max in interval", value=1000)
+    step_sustained = st.number_input("Steps sustained (buckets)", value=5, min_value=0)
+    st.markdown("---")
+    st.subheader("Model Options")
+    residual_std = st.slider("Residual threshold (std multiples)", 1.0, 5.0, 3.0)
+    use_prophet = st.checkbox("Enable Prophet residual detection", value=PROPHET_AVAILABLE)
+    if use_prophet and not PROPHET_AVAILABLE:
+        st.warning("Prophet not installed. Uncheck to skip.")
+    use_iforest = st.checkbox("Enable Isolation Forest", value=True)
+    iforest_cont = st.slider("IsolationForest contamination", 0.001, 0.2, 0.01, step=0.001)
+    use_clusters = st.checkbox("Enable clustering anomalies", value=True)
+    st.markdown("---")
+    st.subheader("Exports & Extras")
+    enable_png = st.checkbox("Enable PNG export (kaleido)", value=KALEIDO_AVAILABLE)
+    enable_pptx = st.checkbox("Enable PPTX export (python-pptx)", value=PPTX_AVAILABLE)
+    st.markdown("---")
+    st.subheader("Realtime / Simulation")
+    realtime = st.checkbox("Enable realtime playback simulation", value=False)
+    sim_speed = st.slider("Playback delay (ms per step)", 10, 1000, 200, step=10)
+    st.markdown("---")
+    st.button("Run Analysis")
+
+# -------------------------
+# Data loading
+# -------------------------
+data: Dict[str, pd.DataFrame] = {}
+if data_mode == "Sample Data":
+    data = create_sample_data(single_day=str(date_filter))
+else:
+    st.info("Upload CSVs for heart rate, steps, and/or sleep (optional).")
+    uploaded_hr = st.file_uploader("Heart Rate CSV", type=["csv"])
+    uploaded_steps = st.file_uploader("Steps CSV", type=["csv"])
+    uploaded_sleep = st.file_uploader("Sleep CSV", type=["csv"])
+    try:
+        if uploaded_hr:
+            df_hr = pd.read_csv(uploaded_hr)
+            if "timestamp" in df_hr.columns:
+                df_hr["timestamp"] = pd.to_datetime(df_hr["timestamp"])
+            data["heart_rate"] = df_hr
+        if uploaded_steps:
+            df_steps = pd.read_csv(uploaded_steps)
+            if "timestamp" in df_steps.columns:
+                df_steps["timestamp"] = pd.to_datetime(df_steps["timestamp"])
+            data["steps"] = df_steps
+        if uploaded_sleep:
+            df_sleep = pd.read_csv(uploaded_sleep)
+            if "timestamp" in df_sleep.columns:
+                df_sleep["timestamp"] = pd.to_datetime(df_sleep["timestamp"])
+            data["sleep"] = df_sleep
+    except Exception as e:
+        st.error(f"Failed to read uploaded files: {e}")
+
+# fill missing with sample
+sample = create_sample_data(single_day=str(date_filter))
+for k in ["heart_rate", "steps", "sleep"]:
+    if k not in data:
+        data[k] = sample[k]
+
+# -------------------------
+# Initialize detectors & rules
+# -------------------------
+threshold_rules = {
+    "heart_rate": {"col": "heart_rate", "min": hr_min, "max": hr_max, "sustained_min": int(hr_sustained)},
+    "steps": {"col": "step_count", "min": 0, "max": int(step_max), "sustained_min": int(step_sustained)},
+    "sleep": {"col": "duration_minutes", "min": 180, "max": 720, "sustained_min": 0},
+}
+thr_detector = ThresholdAnomaly(rules=threshold_rules)
+prop_detector = ProphetResidual(std_thresh=float(residual_std))
+if_detector = IsolationForestDetector(contamination=float(iforest_cont))
+cl_detector = ClusterDetector()
+
+reports: Dict[str, Dict] = {}
+processed: Dict[str, pd.DataFrame] = {}
+fig_images: List[bytes] = []
+fig_titles: List[str] = []
+
+# -------------------------
+# Page layout (two columns)
+# -------------------------
+left_col, right_col = st.columns([1, 2])
+with left_col:
+    st.subheader("Data Preview")
+    for name, df in data.items():
+        st.markdown(f"**{name.replace('_', ' ').title()}**")
+        st.dataframe(df.head(5))
+
+with right_col:
+    st.subheader("Analysis & Visuals")
+    for dtype, df in data.items():
+        st.markdown("---")
+        st.header(dtype.replace("_", " ").title())
+        df_local = df.copy()
+        if "timestamp" in df_local.columns:
+            df_local["timestamp"] = pd.to_datetime(df_local["timestamp"])
+            df_local = df_local.sort_values("timestamp")
+        # optional time filter
+        if time_filter and "timestamp" in df_local.columns:
+            start_h, end_h = trange
+            df_local = df_local[df_local["timestamp"].dt.hour.between(start_h, end_h)]
+        reports.setdefault(dtype, {})
+
+        # create derived features if possible
+        if dtype == "heart_rate":
+            if "heart_rate" in df_local.columns and "timestamp" in df_local.columns:
+                df_local["hr_to_steps_ratio"] = df_local["heart_rate"] / (df_local.get("step_count", 0) + 1)
+                df_local["rolling_avg_hr"] = df_local["heart_rate"].rolling(window=10, min_periods=1).mean()
+                df_local["daily_variability"] = df_local["heart_rate"].rolling(window=30, min_periods=1).std().fillna(0)
+        elif dtype == "steps":
+            # ensure bucket alignment if necessary
+            df_local = df_local.sort_values("timestamp")
+        # threshold detector
+        df_th, rep_th = thr_detector.detect(df_local, dtype)
+        reports[dtype]["threshold"] = rep_th
+
+        # prophet residuals
+        if use_prophet and PROPHET_AVAILABLE and "timestamp" in df_th.columns:
+            df_res, rep_res = prop_detector.fit_and_detect(df_th, dtype)
+            reports[dtype]["residual"] = rep_res
+        else:
+            df_res = df_th
+            if use_prophet and not PROPHET_AVAILABLE:
+                reports[dtype]["residual"] = {"error": "prophet_not_installed"}
+
+        # isolation forest
+        if use_iforest:
+            numeric_cols = df_res.select_dtypes(include=[np.number]).columns.tolist()
+            df_if, rep_if = if_detector.detect(df_res, numeric_cols)
+            reports[dtype]["isolation_forest"] = rep_if
+            df_res = df_if
+
+        # cluster-based
+        if use_clusters:
+            numeric_cols = df_res.select_dtypes(include=[np.number]).columns.tolist()
+            df_cl, rep_cl = cl_detector.detect(df_res, numeric_cols, method="kmeans", k=3)
+            reports[dtype]["cluster"] = rep_cl
+            df_res = df_cl
+
+        processed[dtype] = df_res
+
+        # plotting
+        if dtype == "heart_rate":
+            fig = plot_hr(df_res, title=f"Heart Rate — {dtype}")
+            st.plotly_chart(fig, use_container_width=True)
+            heat = plot_hr_heatmap(df_res)
+            st.plotly_chart(heat, use_container_width=True)
+        elif dtype == "steps":
+            fig = plot_steps(df_res, title=f"Steps — {dtype}")
+            st.plotly_chart(fig, use_container_width=True)
+        elif dtype == "sleep":
+            fig = plot_sleep(df_res, title=f"Sleep — {dtype}")
+            st.plotly_chart(fig, use_container_width=True)
+
+        # capture figure for export if enabled
+        try:
+            if enable_png and KALEIDO_AVAILABLE:
+                img_bytes = fig_to_png_bytes(fig)
+                fig_images.append(img_bytes)
+                fig_titles.append(f"{dtype}_main_{now_str()}")
+        except Exception:
+            # optional export may fail silently
+            pass
+
+        # show anomaly table
+        anomaly_cols = [c for c in df_res.columns if "anomaly" in c.lower()]
+        if anomaly_cols:
+            mask = df_res[anomaly_cols].any(axis=1)
+            anomalies_df = df_res[mask]
+            st.markdown(f"**Detected anomalies ({len(anomalies_df)})**")
+            if not anomalies_df.empty:
+                st.dataframe(anomalies_df.head(200))
+            else:
+                st.info("No anomalies found for this data type.")
+
+# -------------------------
+# Summary metrics (cards)
+# -------------------------
+st.markdown("---")
+st.subheader("Summary Metrics")
+hr_anoms = reports.get("heart_rate", {}).get("threshold", {}).get("anomalies", 0)
+steps_anoms = reports.get("steps", {}).get("threshold", {}).get("anomalies", 0)
+sleep_anoms = reports.get("sleep", {}).get("threshold", {}).get("anomalies", 0)
+total_anoms = 0
+for dtype, methods in reports.items():
+    for mname, rep in methods.items():
+        try:
+            total_anoms += int(rep.get("anomalies", 0))
+        except Exception:
+            pass
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("❤️ HR Thresh Anoms", f"{hr_anoms}")
+c2.metric("🚶 Steps Thresh Anoms", f"{steps_anoms}")
+c3.metric("🛌 Sleep Thresh Anoms", f"{sleep_anoms}")
+c4.metric("🔎 Total Anomalies", f"{total_anoms}")
+
+# -------------------------
+# Notifications (placeholder)
+# -------------------------
+st.markdown("---")
+if st.button("Send Notification (placeholder)"):
+    summary = {"total_anomalies": total_anoms, "reports": reports}
+    st.info("Notification placeholder — would send summary via email/SMS/API")
+    st.json(summary)
+
+# -------------------------
+# Exports
+# -------------------------
+st.markdown("---")
+st.subheader("Exports")
+col_a, col_b, col_c = st.columns(3)
+with col_a:
+    if st.button("Download Reports (JSON)"):
+        blob = json.dumps(reports, default=str, indent=2)
+        st.download_button("Download JSON", blob, file_name=f"reports_{now_str()}.json", mime="application/json")
+with col_b:
+    if st.button("Download All Data (Excel)"):
+        try:
+            xbytes = df_to_excel_bytes(processed)
+            st.download_button("Download Excel", xbytes, file_name=f"all_data_{now_str()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception as e:
+            st.error(f"Excel export failed: {e}")
+with col_c:
+    if st.button("Download anomalies CSV"):
+        parts = []
+        for dtype, dfp in processed.items():
+            cols = [c for c in dfp.columns if "anomaly" in c.lower()]
+            if cols:
+                mask = dfp[cols].any(axis=1)
+                if mask.any():
+                    tmp = dfp[mask].copy()
+                    tmp["data_type"] = dtype
+                    parts.append(tmp)
+        if parts:
+            combined = pd.concat(parts, ignore_index=True)
+            st.download_button("Download CSV", combined.to_csv(index=False), file_name=f"anomalies_{now_str()}.csv", mime="text/csv")
+        else:
+            st.info("No anomalies to export.")
+
+# PNG/PPTX exports
+if enable_png and KALEIDO_AVAILABLE and fig_images:
+    if st.button("Download first plot PNG"):
+        st.download_button("Download PNG", fig_images[0], file_name=f"{fig_titles[0]}_{now_str()}.png", mime="image/png")
+elif enable_png and not KALEIDO_AVAILABLE:
+    st.info("kaleido required for PNG export — install `kaleido`")
+
+if enable_pptx and PPTX_AVAILABLE and fig_images:
+    if st.button("Download PPTX with plots"):
+        try:
+            pptx_bytes = create_pptx_with_images(fig_images, fig_titles)
+            st.download_button("Download PPTX", pptx_bytes, file_name=f"plots_{now_str()}.pptx", mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        except Exception as e:
+            st.error(f"Failed to create PPTX: {e}")
+elif enable_pptx and not PPTX_AVAILABLE:
+    st.info("python-pptx required for PPTX export — install `python-pptx`")
+
+# -------------------------
+# Realtime playback simulation
+# -------------------------
+if realtime:
+    st.markdown("---")
+    st.header("Realtime Playback Simulation")
+    dtype = st.selectbox("Stream which data", list(processed.keys()), index=0)
+    df_stream = processed.get(dtype, pd.DataFrame()).copy()
+    if "timestamp" in df_stream.columns and not df_stream.empty:
+        df_stream = df_stream.sort_values("timestamp").reset_index(drop=True)
+        # controls using session_state
+        if "play" not in st.session_state:
+            st.session_state.play = False
+        start = st.button("Start Stream")
+        stop = st.button("Stop Stream")
+        if start:
+            st.session_state.play = True
+        if stop:
+            st.session_state.play = False
+
+        placeholder = st.empty()
+        import time
+        i = 0
+        while st.session_state.play and i < len(df_stream):
+            chunk = df_stream.iloc[: i + 1]
+            if dtype == "heart_rate":
+                f = plot_hr(chunk, title=f"Realtime HR ({i+1}/{len(df_stream)})")
+            elif dtype == "steps":
+                f = plot_steps(chunk, title=f"Realtime Steps ({i+1}/{len(df_stream)})")
+            else:
+                f = plot_sleep(chunk, title=f"Realtime Sleep ({i+1}/{len(df_stream)})")
+            placeholder.plotly_chart(f, use_container_width=True)
+            i += 1
+            time.sleep(sim_speed / 1000.0)
+        if not st.session_state.play:
+            st.info("Playback stopped.")
+    else:
+        st.info("Selected dataset has no timestamp column or is empty; cannot stream.")
+
+st.markdown("---")
+st.caption("Tip: Install optional packages (Prophet, tsfresh, kaleido, python-pptx) to unlock advanced features.")
