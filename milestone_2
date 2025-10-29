@@ -1,0 +1,230 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import json
+from tsfresh import extract_features
+from tsfresh.utilities.dataframe_functions import impute
+from tsfresh.feature_extraction import MinimalFCParameters
+from prophet import Prophet
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.ensemble import IsolationForest
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+import plotly.express as px
+import plotly.graph_objects as go
+
+# ----------------------------------------
+# SECTION 1: SAMPLE HEALTH DATA GENERATION
+# ----------------------------------------
+@st.cache_data
+def create_sample_health_data():
+    timestamps = pd.date_range(start='2024-01-01 08:00:00', periods=480, freq='1min')
+    hr, steps, sleep = [], [], []
+    for ts in timestamps:
+        hr_factor = 1.0
+        if 9 <= ts.hour < 10: hr_factor = 1.5
+        if 14 <= ts.hour < 15: hr_factor = 1.3
+        heart_rate = max(50, min(150, 70 * hr_factor + np.random.normal(0, 3)))
+        hr.append(heart_rate)
+
+        step_value = 0
+        if 8 <= ts.hour < 10 or 17 <= ts.hour < 19:
+            step_value = np.random.randint(20, 150)
+        steps.append(step_value)
+
+        sleep_value = 1 if 0 <= ts.hour < 6 else 0
+        sleep.append(sleep_value)
+
+    df = pd.DataFrame({
+        'timestamp': timestamps,
+        'heart_rate': hr,
+        'step_count': steps,
+        'sleep_count': sleep
+    })
+    df['hr_to_steps_ratio'] = df['heart_rate'] / (df['step_count'] + 1)
+    df['rolling_avg_hr'] = df['heart_rate'].rolling(window=10, min_periods=1).mean()
+    df['daily_variability'] = df['heart_rate'].rolling(window=30, min_periods=1).std().fillna(0)
+    return df
+
+
+# ----------------------------------------
+# SECTION 2: TSFRESH FEATURE EXTRACTION
+# ----------------------------------------
+def extract_tsfresh_features(df, window_size=60):
+    df_sorted = df.sort_values('timestamp').reset_index(drop=True)
+    step_size = max(1, window_size // 2)
+    windows = []
+    window_id = 0
+    for i in range(0, len(df_sorted) - window_size + 1, step_size):
+        window = df_sorted.iloc[i:i+window_size].copy()
+        window['window_id'] = window_id
+        temp = window.melt(
+            id_vars=['window_id', 'timestamp'],
+            value_vars=[
+                'heart_rate', 'step_count', 'sleep_count',
+                'hr_to_steps_ratio', 'rolling_avg_hr', 'daily_variability'
+            ],
+            var_name='kind', value_name='value'
+        )
+        windows.append(temp)
+        window_id += 1
+
+    if not windows:
+        st.warning("⚠️ Not enough data for TSFresh feature extraction.")
+        return pd.DataFrame()
+
+    df_windows = pd.concat(windows, ignore_index=True)
+    features = extract_features(
+        df_windows,
+        column_id='window_id',
+        column_sort='timestamp',
+        column_kind='kind',
+        column_value='value',
+        default_fc_parameters=MinimalFCParameters()
+    )
+    features = impute(features)
+    return features
+
+
+# ----------------------------------------
+# SECTION 3: PROPHET FORECAST
+# ----------------------------------------
+def prophet_forecast(df, metric, periods=60):
+    df_prophet = df.rename(columns={'timestamp': 'ds', metric: 'y'})[['ds', 'y']].dropna()
+    if len(df_prophet) < 5:
+        raise ValueError("Not enough data for Prophet forecasting.")
+    model = Prophet(daily_seasonality=True)
+    model.fit(df_prophet)
+    future = model.make_future_dataframe(periods=periods, freq='min')
+    forecast = model.predict(future)
+    return forecast
+
+
+# ----------------------------------------
+# SECTION 4: CLUSTERING
+# ----------------------------------------
+def cluster_features(features, n_clusters=3):
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(features_scaled)
+    return labels, features_scaled
+
+
+# ----------------------------------------
+# SECTION 5: ANOMALY DETECTION PIPELINE
+# ----------------------------------------
+def run_anomaly_detection(df):
+    required = ['heart_rate', 'step_count', 'hr_to_steps_ratio']
+    for col in required:
+        if col not in df.columns:
+            raise ValueError(f"Missing column: {col}")
+
+    preprocessor = ColumnTransformer([
+        ('scale', StandardScaler(), required)
+    ])
+    pipe = Pipeline([
+        ('prep', preprocessor),
+        ('iso', IsolationForest(contamination=0.03, random_state=42))
+    ])
+    pipe.fit(df)
+    df = df.copy()
+    df['is_anomaly'] = pipe.predict(df)
+    df['anomaly_score'] = pipe.decision_function(df)
+    return df
+
+
+# ----------------------------------------
+# SECTION 6: STREAMLIT UI
+# ----------------------------------------
+st.title("💓 Milestone 2: Health Data Feature Extraction, Forecasting & Anomaly Detection")
+
+# Sidebar controls
+window_size = st.sidebar.slider("Feature Window Size (minutes)", 10, 120, 60, 10)
+forecast_periods = st.sidebar.slider("Forecast Periods", 50, 500, 100, 50)
+n_clusters = st.sidebar.slider("KMeans Clusters", 2, 10, 3)
+use_sample = st.sidebar.checkbox("Use Sample Data", True)
+
+st.sidebar.markdown("### 📤 Upload Your Own Data")
+uploaded_file = st.sidebar.file_uploader("Upload CSV or JSON", type=["csv", "json"])
+
+# Load data
+if uploaded_file is not None:
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_json(uploaded_file)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+        df = df.dropna(subset=['timestamp'])
+        if 'sleep_count' not in df.columns:
+            df['sleep_count'] = 0
+        df['hr_to_steps_ratio'] = df['heart_rate'] / (df['step_count'] + 1)
+        df['rolling_avg_hr'] = df['heart_rate'].rolling(window=10, min_periods=1).mean()
+        df['daily_variability'] = df['heart_rate'].rolling(window=30, min_periods=1).std().fillna(0)
+        st.session_state.df = df
+        st.success("✅ Uploaded data loaded successfully!")
+    except Exception as e:
+        st.error(f"Upload failed: {e}")
+else:
+    st.session_state.df = create_sample_health_data()
+
+df = st.session_state.df
+
+# ----------------------------------------
+# SECTION 7: DATA PREVIEW AND VISUALS
+# ----------------------------------------
+st.subheader("📊 Data Preview")
+st.dataframe(df.head())
+
+# Separate visualizations
+st.subheader("❤️ Heart Rate Over Time")
+st.plotly_chart(px.line(df, x='timestamp', y='heart_rate', title='Heart Rate Trend'), use_container_width=True)
+
+st.subheader("🚶 Step Count Over Time")
+st.plotly_chart(px.line(df, x='timestamp', y='step_count', title='Step Count Activity'), use_container_width=True)
+
+st.subheader("😴 Sleep Count Pattern")
+st.plotly_chart(px.line(df, x='timestamp', y='sleep_count', title='Sleep Pattern'), use_container_width=True)
+
+# ----------------------------------------
+# SECTION 8: RUN FULL PIPELINE
+# ----------------------------------------
+if st.button("🚀 Run Full Health Data Pipeline"):
+    try:
+        st.info("Extracting features...")
+        features = extract_tsfresh_features(df, window_size)
+        if features.empty:
+            st.warning("Not enough data for TSFresh features.")
+        else:
+            st.success(f"✅ Extracted {features.shape[1]} features.")
+
+            # Clustering
+            st.info("Running KMeans clustering...")
+            labels, scaled = cluster_features(features, n_clusters)
+            pca = PCA(n_components=2)
+            reduced = pca.fit_transform(scaled)
+            df_plot = pd.DataFrame({'PC1': reduced[:, 0], 'PC2': reduced[:, 1], 'Cluster': labels.astype(str)})
+            st.plotly_chart(px.scatter(df_plot, x='PC1', y='PC2', color='Cluster', title="🌀 Cluster Visualization"), use_container_width=True)
+
+        # Forecasting
+        for metric in ['heart_rate', 'step_count', 'sleep_count']:
+            st.subheader(f"🔮 Forecast for {metric.replace('_', ' ').title()}")
+            forecast = prophet_forecast(df, metric, forecast_periods)
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df['timestamp'], y=df[metric], mode='lines', name='Actual'))
+            fig.add_trace(go.Scatter(x=forecast['ds'], y=forecast['yhat'], mode='lines', name='Forecast'))
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Anomaly detection
+        st.subheader("🚨 Anomaly Detection")
+        df_anom = run_anomaly_detection(df)
+        anomalies = df_anom[df_anom['is_anomaly'] == -1]
+        st.write(f"Detected {len(anomalies)} anomalies out of {len(df_anom)} records.")
+        st.plotly_chart(px.scatter(df_anom, x='timestamp', y='heart_rate',
+                                   color=df_anom['is_anomaly'].map({1: 'Normal', -1: 'Anomaly'}),
+                                   title="❤️ Heart Rate Anomalies"), use_container_width=True)
+    except Exception as e:
+        st.error(f"Pipeline error: {e}")
